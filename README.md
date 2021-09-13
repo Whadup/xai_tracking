@@ -8,7 +8,7 @@ This is the pytorch implementation for our paper "Explaining Deep Learning Repre
 > Our method is general: it can be wrapped around any iterative optimization procedure and covers a variety of neural network architectures, including feed-forward networks and convolutional neural networks. We first propose a method for stochastic training with single training instances, but continue to also derive a variant for the common mini-batch training.
 > In experimental evaluations, we show that our method identifies highly representative training instances that can be used as an explanation. Additionally, we propose a visualization that provides explanations in the form of aggregated statistics over the whole training process.
 
-Currently contains two experiments: cifar10 and gnn that can be executed via `python -m {cifar10|gnn}.train`
+Currently contains two experiments: cifar10 and gnn that can be executed via `python -m {cifar10|gnn}.train` to train the model and `python -m {cifar10|gnn}.explain` to generate a sample explanation.
 
 __To-Do:__
 

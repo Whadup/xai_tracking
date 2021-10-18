@@ -75,7 +75,7 @@ def main():
 
     
     # optimizer = torch.optim.SGD(net.parameters(), lr=0.00666, weight_decay=0.0340)
-    optimizer = WrappedOptimizer(torch.optim.SGD, history_file="/raid//cifar10_tmp.hdf5")(net.parameters(), lr=0.01)
+    optimizer = WrappedOptimizer(torch.optim.SGD, history_file="/raid/cifar10_tmp.hdf5")(net.parameters(), lr=0.01)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=15, gamma=0.1)
     loss = nn.CrossEntropyLoss(reduction="none")
     # loss = nn.BCEWithLogitsLoss()

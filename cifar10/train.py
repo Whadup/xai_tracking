@@ -15,9 +15,9 @@ import tqdm
 import pickle
 from typing import Tuple, Any
 
-from xai import *
-from vgg import VGG_net
-from ridgeplot import ridge_plot
+from xai_tracking.xai import *
+from xai_tracking.nn import VGG_net
+# from ridgeplot import ridge_plot
 torch.multiprocessing.set_sharing_strategy('file_system')
 import os
 PATH = os.path.dirname(__file__)
@@ -48,16 +48,29 @@ class CIFAR10_ind(CIFAR10):
 
 
 def main():
+    example_wise = True
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(device)
     transform = transforms.Compose(
         [transforms.ToTensor(),
         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
+    train_transform = transforms.Compose(
+        [transforms.RandomHorizontalFlip(),
+         transforms.RandomCrop(size=[32,32], padding=4),
+         transform]
+    )
     batch_size = 128
-    ghost_samples = 40
+
+    if not example_wise:
+        ghost_samples = 40
+    else:
+        ghost_samples = 0
     trainset = WrappedDataset(CIFAR10(root='cifar10/data', train=True,
-                                            download=True, transform=transform))
-    trainloader = torch.utils.data.DataLoader(trainset, batch_sampler=ClassSampler(trainset, batch_size, True, ghost_samples), num_workers=28)
+                                            download=True, transform=train_transform))
+    if example_wise:
+        trainloader = torch.utils.data.DataLoader(trainset, batch_size=batch_size, shuffle=True, drop_last=True)
+    else:
+        trainloader = torch.utils.data.DataLoader(trainset, batch_sampler=ClassSampler(trainset, batch_size, True, ghost_samples), num_workers=28)
     testset = WrappedDataset(CIFAR10(root='cifar10/data', train=False,
                                         download=True, transform=transform))
     testloader = torch.utils.data.DataLoader(testset, batch_size=batch_size,
@@ -69,61 +82,50 @@ def main():
     print("loaded data...")
     CLASS_NAMES = ('plane', 'car', 'bird', 'cat',
             'deer', 'dog', 'frog', 'horse', 'ship', 'truck')
-    net = VGG_net().to_sequential()
+    net = VGG_net(ghost_samples=ghost_samples).to_sequential()
     # net.load_state_dict(torch.load("network10.pt"))
     net = net.to(device)
 
     
     # optimizer = torch.optim.SGD(net.parameters(), lr=0.00666, weight_decay=0.0340)
-    optimizer = WrappedOptimizer(torch.optim.SGD, history_file="/raid/cifar10_tmp.hdf5")(net.parameters(), lr=0.01)
+    optimizer = WrappedSGD(net.parameters(), lr=0.01, history_file="/raid/pfahler/cifar10.hdf5")
+    optimizer.hookup(net)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=15, gamma=0.1)
     loss = nn.CrossEntropyLoss(reduction="none")
     # loss = nn.BCEWithLogitsLoss()
 
-    for e in range(35):
+    for e in range(15):
         print("starting epoch: " + str(e))
         correct = 0
         total = 0
-
+        total_loss = 0
         net.train()
         pbar = tqdm.tqdm(trainloader)
+
         for data in pbar:
             # get the inputs; data is a list of [inputs, labels, index of batch]
             inputs, labels, ind = data
             inputs, labels = inputs.to(device), labels.to(device)
-            if len(labels) < 128:
-                continue
-            # print(CLASS_NAMES[labels[:1].item()])
-            # contributions, preactivations, cosines, dot_products, norms, l = explain(net, inputs[:1])
-            # classes, weights = class_statistics(contributions, preactivations, cosines, norms, l)
-            # for layer in classes:
-            #     dirs, sample_weights = classes[layer], weights[layer]
-            #     dirs = {CLASS_NAMES[y]:d for y,d in dirs.items()}
-            #     sample_weights = {CLASS_NAMES[y]:d for y,d in sample_weights.items()}
-            #     plot = ridge_plot(dirs, sample_weights=sample_weights)
-            #     plot.write_html(f"{layer}.html")
-            # print(list([c.shape for c in contributions]))
-            # print(list([c.shape for c in preactivations]))
-            # print(list([c.shape for c in cosines]))
-            # print(l.shape)
-            # for c in cosines:
-            #     print(torch.histc(c,21,c.min(),c.max()))
-            # asdfs
             # zero the parameter gradients
             optimizer.zero_grad()
             # forward + backward + optimize
             outputs = net(inputs)
-            # print(torch.nn.functional.one_hot(labels, num_classes=10))
-            # l = loss(outputs, torch.nn.functional.one_hot(labels, num_classes=10).float())
-            l = loss(outputs, labels)[:-ghost_samples].mean()
-
             _, predicted = torch.max(outputs.data, 1)
-            total += labels[:-ghost_samples].size(0) 
-            correct += (predicted == labels)[:-ghost_samples].sum().item()
-            pbar.set_description(f"Loss: {l.item():.4f} Accuracy: {1.0 * correct / total:.4f}")
+            if ghost_samples > 0:
+                l = loss(outputs, labels)[:-ghost_samples].mean()
+                total += labels[:-ghost_samples].size(0) 
+                correct += (predicted == labels)[:-ghost_samples].sum().item()
+                total_loss += l.item() * labels[:-ghost_samples].size(0) 
+
+            else:
+                l = loss(outputs, labels).mean()
+                total += labels.size(0) 
+                correct += (predicted == labels).sum().item()
+                total_loss += l.item() * labels.size(0) 
+            pbar.set_description(f"Loss: {total_loss / total:.4f} Accuracy: {1.0 * correct / total:.4f}")
             l.backward()
-            optimizer.step()
-            optimizer.archive(ids=ind, labels=labels)
+            optimizer.step(ids=ind, labels=labels)
+
 
         torch.save(net.state_dict(), os.path.join(PATH, "cifar10.pt"))
         # torch.save(net.state_dict(), "network.pt")

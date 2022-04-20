@@ -1,0 +1,3 @@
+[submodule "vector-summarization-coreset"]
+	path = vector-summarization-coreset
+	url = https://github.com/alaamaalouf/vector-summarization-coreset.git

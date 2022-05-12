@@ -14,38 +14,15 @@ from math import sqrt
 import tqdm
 import pickle
 from typing import Tuple, Any
+from torchinfo import summary
 
 from xai_tracking.xai import *
-from xai_tracking.nn import VGG_net
+from xai_tracking.nn import VGG_net, resnet50, resnet18
 # from ridgeplot import ridge_plot
-torch.multiprocessing.set_sharing_strategy('file_system')
+# torch.multiprocessing.set_sharing_strategy('file_system')
+import multiprocessing
 import os
 PATH = os.path.dirname(__file__)
-
-class CIFAR10_ind(CIFAR10):
-    """
-    Wraps the CIFAR10 dataset to also return example ids.
-    """
-    
-    def __init__(
-            self,
-            *args, **kwargs
-    ) -> None:
-
-        super().__init__(*args, **kwargs)
-
-    def __getitem__(self, index: int) -> Tuple[Any, Any, Any]:
-        """
-        Args:
-            index (int): Index
-
-        Returns:
-            tuple: (image, target) where target is index of the target class.
-        """
-        x = super().__getitem__(index)
-        return (*x, index)
-
-
 
 def main():
     example_wise = True
@@ -53,11 +30,14 @@ def main():
     print(device)
     transform = transforms.Compose(
         [transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),]
+    )
     train_transform = transforms.Compose(
-        [transforms.RandomHorizontalFlip(),
-         transforms.RandomCrop(size=[32,32], padding=4),
-         transform]
+        [transforms.RandomCrop(size=[32,32], padding=4),
+         transforms.RandomHorizontalFlip(),
+         transforms.ToTensor(),
+         transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
+        ]
     )
     batch_size = 128
 
@@ -68,13 +48,13 @@ def main():
     trainset = WrappedDataset(CIFAR10(root='cifar10/data', train=True,
                                             download=True, transform=train_transform))
     if example_wise:
-        trainloader = torch.utils.data.DataLoader(trainset, batch_size=batch_size, shuffle=True, drop_last=True)
+        trainloader = torch.utils.data.DataLoader(trainset, batch_size=batch_size, shuffle=True, drop_last=True, pin_memory=True)
     else:
-        trainloader = torch.utils.data.DataLoader(trainset, batch_sampler=ClassSampler(trainset, batch_size, True, ghost_samples), num_workers=28)
+        trainloader = torch.utils.data.DataLoader(trainset, batch_sampler=ClassSampler(trainset, batch_size, True, ghost_samples), num_workers=10, persistent_workers=True)
     testset = WrappedDataset(CIFAR10(root='cifar10/data', train=False,
                                         download=True, transform=transform))
-    testloader = torch.utils.data.DataLoader(testset, batch_size=batch_size,
-                                            shuffle=False, num_workers=8)
+    testloader = torch.utils.data.DataLoader(testset, batch_size=2 * batch_size,
+                                            shuffle=False)
     # problem mit shuffle true
     # brauchen eigenen sampler eventuell?
     # so? https://discuss.pytorch.org/t/index-concept-in-torch-utils-data-dataloader/72449/6
@@ -82,19 +62,27 @@ def main():
     print("loaded data...")
     CLASS_NAMES = ('plane', 'car', 'bird', 'cat',
             'deer', 'dog', 'frog', 'horse', 'ship', 'truck')
-    net = VGG_net(ghost_samples=ghost_samples).to_sequential()
-    # net.load_state_dict(torch.load("network10.pt"))
-    net = net.to(device)
 
+    net = VGG_net(ghost_samples=ghost_samples).to_sequential()
+    # net = resnet18(num_classes=10).to_sequential()
+    # net.load_state_dict(torch.load("network10.pt"))
+    # summary(net, input_size=(batch_size, 3, 32, 32))
+    net = net.to(device)
     
-    # optimizer = torch.optim.SGD(net.parameters(), lr=0.00666, weight_decay=0.0340)
-    optimizer = WrappedSGD(net.parameters(), lr=0.01, history_file="/raid/pfahler/cifar10.hdf5")
-    optimizer.hookup(net)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=15, gamma=0.1)
+    if example_wise:
+        optimizer = WrappedSGD(net.parameters(), lr=0.1, momentum=0.0, weight_decay=0.0, history_file="/ceph/cifar10_history")
+        optimizer.hookup(net)
+    else:
+        optimizer = torch.optim.SGD(net.parameters(), lr=0.001, momentum=0.9, weight_decay=5e-4) 
+
+    # optimizer = WrappedSGD(net.parameters(), lr=0.1, history_file="/raid/pfahler/cifar10_history")
+
+    # scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=40, gamma=0.1)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200)
     loss = nn.CrossEntropyLoss(reduction="none")
     # loss = nn.BCEWithLogitsLoss()
 
-    for e in range(15):
+    for e in range(200):
         print("starting epoch: " + str(e))
         correct = 0
         total = 0
@@ -142,17 +130,19 @@ def main():
                 inputs, labels, ind = data
                 inputs, labels = inputs.to(device), labels.to(device)
                 outputs = net(inputs)
-                _, predicted = torch.max(outputs.data, 1)
+                predicted = outputs.argmax(1)
                 total += labels.size(0) 
                 correct += (predicted == labels).sum().item()
-        test_acc = correct/total
+        test_acc = correct / total
         print("Test accuracy is: " + str(test_acc))
         scheduler.step()
         net = net.to(device)
     torch.save(net.state_dict(), os.path.join(PATH, "cifar10.pt"))
     # torch.save(net.cpu().state_dict(), "cifar_log.pt")  
+    optimizer.done()
     print("done with everything")
 
 if __name__ == "__main__":
+    multiprocessing.set_start_method("spawn")
     main()
 

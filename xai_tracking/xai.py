@@ -1,4 +1,5 @@
 from multiprocessing import shared_memory, Queue, Process
+import os
 import multiprocessing
 # multiprocessing.set_start_method("spawn")
 import torch
@@ -17,7 +18,7 @@ import itertools
 import io
 from copy import deepcopy
 
-FULL_BUFFER = 8
+FULL_BUFFER = 64
 HALF_BUFFER = FULL_BUFFER // 2
 
 #import torch_geometric
@@ -143,7 +144,7 @@ def probabilistic_coreset(X, epsilon, delta):
     print((true * est).sum() / (np.linalg.norm(true) * np.linalg.norm(est)))
     return S[i]
 
-def coreset_worker(key=None, shape=None, shm=None, shm2=None, queue=None, lock=None):
+def store_fullrank(key=None, shape=None, shm=None, shm2=None, queue=None, lock=None):
     from vector_summarization_coreset.FastEpsCoreset import sparseEpsCoreset
     from vector_summarization_coreset.Utils import getNormalizedWeightedSet
     import vector_summarization_coreset.FrankWolfeCoreset as FWC
@@ -159,72 +160,63 @@ def coreset_worker(key=None, shape=None, shm=None, shm2=None, queue=None, lock=N
     j = 0
     while True:
         try:
-            workload = queue.get()
+            workload_start, workload_end = queue.get()
             try:
-                data = array[workload:workload + HALF_BUFFER * 512]
-                batch_ids = ids[workload:workload + HALF_BUFFER * 512]
+                data = array[workload_start:workload_end]
+                batch_ids = ids[workload_start:workload_end]
                 # data = data.reshape(HALF_BUFFER * 512, -1)
                 with lock:
-                    np.save("/raid/pfahler/history" + key + "." + str(j), data)
+                    np.save(key + "." + str(j), data)
+                    np.save(os.path.join(os.path.dirname(key), "ids") +  "." + str(j), batch_ids)
                 j += 1
-                # if dataset is None:
-                #     dataset = np.memmap("/ceph/" + key + "." + str(j) + ".mmap", mode="w+", dtype=np.float32, shape=(1 * 50000, *data.shape[1:]))
-                #     # dataset *= 0.0
-                #     # dataset = bcolz.carray(
-                #     #     data,
-                #     #     rootdir="/raid/pfahler/history/" + key,
-                #     #     mode='w',
-                #     #     expectedlen=50000 * 20,
-                #     #     cparams=bcolz.cparams(cname='lz4', clevel=5))
-                #     # dataset.flush()
-                # else:
-                #     write = len(data)
-                #     if i + write > 50000:
-                #         write = 50000 - i
-                #     dataset[i:i+write] = data[:write]
-                #     if write == len(data):
-                #         i += len(data)
-                #     else:
-                #         j += 1
-                #         dataset.flush()
-                #         dataset = np.memmap("/ceph/history/" + key + "." + str(j) + ".mmap", mode="w+", shape=(1 * 50000, *data.shape[1:]))
-                #         dataset[:len(data[write:])] = data[write:]
-                #         i = len(data[write:])
-                    # dataset.append(data)
-                    # dataset.flush()
-                            # self.datasets[key].flush()
-                # print(batch_ids[:10])
-                # print(dataset[batch_ids].shape, data.dtype, batch_ids.dtype, dataset.dtype, type(dataset))
-                
-                # dataset[batch_ids] += data
-                
-                # dataset.flush()
-                # #coreset = probabilistic_coreset(data, 0.005, 0.01)#
-                # merge_t, weights, mu, sigma = getNormalizedWeightedSet(data, np.ones(len(data)))
-                # cs = FWC.FrankWolfeCoreset(data, np.ones((len(data), 1)), 0.001)
-                # _, weights = cs.computeCoreset()
-                # idxs = np.where(weights>0)[0]
-                # coreset =  data[idxs]
-                # norm = np.linalg.norm(data.sum(axis=0))
-                # data *= len(data) / norm 
-                # true = np.average(data, axis=0) 
-                # # print("TRUE AVERAGE NORM", np.linalg.norm(np.average(data, axis=0)))
-                # var = 1 + (np.linalg.norm((data - true), axis=1) ** 2).mean()
-                # coreset, weights, time, idx = sparseEpsCoreset(data , 1.0 * np.ones(len(data)) / len(data), 10.0 / var, faster=False)
-                # # coreset = data[weights > 0]
-                # # print(coreset.shape, weights.shape, weights[weights>0].shape, idx.shape)
-                # # coreset = sigma * coreset + mu
-                # est = np.average(data, axis=0, weights=weights)
-                # # est = (weights.reshape(-1,1) * data).sum(axis=0) # * len(data) / len(coreset)
-                # # print(est.shape)
-                # cosine = ((true * est).sum() / (np.linalg.norm(true) * np.linalg.norm(est)))
-                # print("Result", len(data), var,  np.linalg.norm(weights, 0), np.linalg.norm(true), np.linalg.norm(est), cosine, np.linalg.norm(true - est) ** 2, np.linalg.norm(true - est) ** 2 / var)
             except Exception as e:
                 raise RuntimeError(e)
-        except ValueError as e:
-            print(e)
-            print("quit worker process for", key)
+        except Exception as e:
+            # print(e)
+            shm.close()
+            shm2.close()
+            # print("quit worker process for", key)
             return
+
+def store_lowrank(key=None, shape1=None, shape2=None, shm_u=None, shm_v=None, shm2=None, queue=None, lock=None):
+    from vector_summarization_coreset.FastEpsCoreset import sparseEpsCoreset
+    from vector_summarization_coreset.Utils import getNormalizedWeightedSet
+    import vector_summarization_coreset.FrankWolfeCoreset as FWC
+
+    shm_u = shared_memory.SharedMemory(name=shm_u)
+    U = np.ndarray(shape1, dtype=np.float32, buffer=shm_u.buf)
+
+    shm_v = shared_memory.SharedMemory(name=shm_v)
+    V = np.ndarray(shape2, dtype=np.float32, buffer=shm_v.buf)
+
+    shm2 = shared_memory.SharedMemory(name=shm2)
+    ids = np.ndarray((shape1[0], ), dtype=np.int32, buffer=shm2.buf)
+
+    dataset = None
+    i = 0
+    j = 0
+    while True:
+        try:
+            workload_start, workload_end = queue.get()
+            try:
+                u = U[workload_start:workload_end]
+                v = V[workload_start:workload_end]
+                batch_ids = ids[workload_start:workload_end]
+                # data = data.reshape(HALF_BUFFER * 512, -1)
+                with lock:
+                    np.save(key + ".U." + str(j), u)
+                    np.save(key + ".V." + str(j), v)
+                    np.save(os.path.join(os.path.dirname(key), "ids") +  "." + str(j), batch_ids)
+                j += 1
+            except Exception as e:
+                raise RuntimeError(e)
+        except Exception as e:
+            # print("quit worker process for", key)
+            shm_u.close()
+            shm_v.close()
+            shm2.close()
+            return
+
 
 second_device = torch.device("cuda:0")
 
@@ -234,7 +226,8 @@ class WrappedSGD(torch.optim.SGD):
             raise RuntimeError("We do not support momentum at the moment.")
         if kwargs.pop("weight_decay", 0.0) > 0:
             raise RuntimeError("We do not support weight decay at the moment.")
-        super().__init__(*args, **kwargs)
+        print("setting stupid default parameters, change this!")
+        super().__init__(*args, **kwargs) # momentum=0.9, weight_decay=5e-4
         self.history_file = history_file
         if mode == "batchwise":
             self.gradient_per_example = False
@@ -251,52 +244,44 @@ class WrappedSGD(torch.optim.SGD):
         
         # self.history =  h5py.File(history_file, "w") #, rdcc_nbytes=64*1024*1024*1024)
         # self.history_grp = self.history.create_group("history")
-        self.datasets = {}
-        self.datasets2 = {}
+        self.history_file = history_file
+        os.makedirs(history_file, exist_ok=True)
+        self.shared_arrays = {}
         self.garbage = []
         self.queues = {}
         self.processes = {}
         self.jit = {}
         self.lock = multiprocessing.Lock()
-        for key in tmp:
-            print(tmp[key].shape, tmp[key].size)
-            if tmp[key].size < 1024*1024 * 16:
-                # self.datasets[key] = self.history_grp.create_dataset(key, (50000, *tmp[key].shape), maxshape=(None, *tmp[key].shape), chunks=(256, *tmp[key].shape), dtype=np.float32)
-                # self.datasets[key][0] = tmp[key]
-                array = np.array(tmp[key][np.newaxis,...])
-                
-                # self.datasets[key] = bcolz.carray(
-                #     np.array(array),
-                #     rootdir="/raid/pfahler/history/" + key,
-                #     mode='w',
-                #     # chunklen=32, 
-                #     expectedlen=50000 * 20,
-                #     cparams=bcolz.cparams(cname='lz4', clevel=8))
-                # self.datasets[key].flush()
-                # self.datasets[key] = np.memmap("/raid/pfahler/history/" + key + ".mmap", mode="w+", shape=(512 * HALF_BUFFER, *tmp[key].shape))
-                print(key, "attempt", flush=True)
-                existing_shm = shared_memory.SharedMemory(create=True, size=512*FULL_BUFFER*tmp[key].nbytes)
-                existing_shm2 = shared_memory.SharedMemory(create=True, size=512*FULL_BUFFER*4)
-                self.garbage.append(existing_shm)
-                self.garbage.append(existing_shm2)
-                self.datasets[key] = np.ndarray((512 * FULL_BUFFER, *tmp[key].shape),  dtype=np.float32, buffer=existing_shm.buf)
-                self.datasets2[key] = np.ndarray((512 * FULL_BUFFER, ),  dtype=np.int32, buffer=existing_shm2.buf)
-                self.queues[key] = Queue(1)
-                self.processes[key] = Process(target=coreset_worker, args=(key, (512 * FULL_BUFFER, *tmp[key].shape), existing_shm.name, existing_shm2.name, self.queues[key], self.lock))
-                self.processes[key].start()
-                # self.datasets[key][...] = 0
-                # self.datasets[key][-1,-1] = 1
-                print(key, "created", flush=True)
-        print("done")
-
-        print(self.datasets.keys())
-            #ds = grp.create_dataset(key, data=tmp[key], compression="lzf")
+        
         self.counter = 0
         self.hooked_up = False
         self.parameter_to_module = {}
         self.per_example_output_buffers = {}
         self.per_example_input_buffers = {}
         self.pinned_buffers = {}
+
+    def __del__(self):
+        self.done()
+
+    def done(self):
+        for module in self.processes:
+            p = self.processes[module]
+            q = self.queues[module]
+            print("Terminate ", p.pid)
+            q.put((self.flush_point, self.counter))
+            q.put(None)
+            p.join()
+            q.close()
+        self.processes = {}
+        self.queues = {}
+        for shm in self.garbage:
+            shm.close()
+            shm.unlink()
+        self.shared_arrays = {}
+        self.garbage = []
+        # for q in self.queues:
+        #     q.close()
+
     @torch.no_grad()
     def hookup(self, model):
         for module in model.modules():
@@ -313,6 +298,58 @@ class WrappedSGD(torch.optim.SGD):
                 module.register_full_backward_hook(store_output)
                 module.register_forward_hook(store_input)
         self.hooked_up = True
+
+    @torch.no_grad()
+    def setup_tracking(self, key, module, X, W):
+        g = torch.empty((X.shape[1], *module.weight.shape), requires_grad=False).pin_memory().to(second_device)
+        self.pinned_buffers[module] = g
+        if torch.numel(g) < torch.numel(X) + torch.numel(W):
+            class _tmp_(torch.nn.Module):
+                batch_size : torch.jit.Final[int] = X.shape[1]
+                stride : torch.jit.Final[int] = module.stride
+                padding : torch.jit.Final[int] = module.padding
+                dilation : torch.jit.Final[int] = module.dilation
+                groups : torch.jit.Final[int] = module.groups
+                def forward(self, g, X, W):
+                    # print(self.stride, self.padding, self.dilation, self.groups)
+                    # print(g[0, :g.shape[1], :g.shape[2], :g.shape[3], :g.shape[4]].shape)
+                    # print(torch.numel(g) *1. / (torch.numel(X) + torch.numel(W)))
+                    with torch.no_grad():
+                        for i in range(self.batch_size):
+                            g[i, :g.shape[1], :g.shape[2], :g.shape[3], :g.shape[4]] = torch.nn.functional.conv2d(X[:,i:i+1,...], W[:,i:i+1,...], None, self.dilation, self.padding, self.stride, self.groups).transpose(0,1)[:g.shape[1], :g.shape[2], :g.shape[3], :g.shape[4]]
+                        return g
+            print("jit compiling backward pass for per-example gradients")
+            self.jit[module] = torch.jit.trace(_tmp_(), (g, X, W), check_trace=False)
+            self.jit[module] = torch.jit.optimize_for_inference(self.jit[module])
+            torch.cuda.empty_cache()
+            existing_shm = shared_memory.SharedMemory(create=True, size=FULL_BUFFER * torch.numel(g) * 4)
+            existing_shm2 = shared_memory.SharedMemory(create=True, size=len(g) * FULL_BUFFER * 4)
+            self.garbage.append(existing_shm)
+            self.garbage.append(existing_shm2)
+            g_array = np.ndarray((X.shape[1] * FULL_BUFFER, *g.shape[1:]),  dtype=np.float32, buffer=existing_shm.buf)
+            print(g_array.shape)
+            id_array = np.ndarray((X.shape[1] * FULL_BUFFER, ),  dtype=np.int32, buffer=existing_shm2.buf)
+            self.shared_arrays[module] = (g_array, id_array)
+            self.queues[module] = Queue(1)
+            self.processes[module] = Process(target=store_fullrank, args=(os.path.join(self.history_file, key), g_array.shape, existing_shm.name, existing_shm2.name, self.queues[module], self.lock))
+            self.processes[module].start()
+        else:
+            existing_shm_u = shared_memory.SharedMemory(create=True, size=FULL_BUFFER * torch.numel(X) * 4)
+            existing_shm_v = shared_memory.SharedMemory(create=True, size=FULL_BUFFER * torch.numel(W) * 4)
+            existing_shm2 = shared_memory.SharedMemory(create=True, size=len(g) * FULL_BUFFER * 4)
+            self.garbage.append(existing_shm_u)
+            self.garbage.append(existing_shm_v)
+            self.garbage.append(existing_shm2)
+            u_array = np.ndarray((X.shape[1] * FULL_BUFFER, X.shape[0], *X.shape[2:]),  dtype=np.float32, buffer=existing_shm_u.buf)
+            v_array = np.ndarray((W.shape[1] * FULL_BUFFER, W.shape[0], *W.shape[2:]),  dtype=np.float32, buffer=existing_shm_v.buf)
+            print(u_array.shape, v_array.shape)
+
+            id_array = np.ndarray((X.shape[1] * FULL_BUFFER, ),  dtype=np.int32, buffer=existing_shm2.buf)
+            self.shared_arrays[module] = (u_array, v_array, id_array)
+            self.queues[module] = Queue(1)
+            self.processes[module] = Process(target=store_lowrank, args=(os.path.join(self.history_file, key), u_array.shape, v_array.shape, existing_shm_u.name, existing_shm_v.name, existing_shm2.name, self.queues[module], self.lock))
+            self.processes[module].start()
+
     @torch.no_grad()
     def step(self, ids, labels, *args):
         if self.gradient_per_example and not self.hooked_up:
@@ -347,46 +384,30 @@ class WrappedSGD(torch.optim.SGD):
                             # with torch.cuda.stream(torch.cuda.Stream()):
                             X = self.per_example_input_buffers[module].transpose(0, 1)#.to(second_device)
                             W = self.per_example_output_buffers[module].transpose(0, 1)#.to(second_device)
-                            if module not in self.pinned_buffers:
-                                g = torch.FloatTensor(X.shape[1], *module.weight.shape).pin_memory().to(second_device)
-                                self.pinned_buffers[module] = g
-                            g = self.pinned_buffers[module]
-                            if module not in self.jit:
-                                class _tmp_(torch.nn.Module):
-                                    batch_size : torch.jit.Final[int] = X.shape[1]
-                                    stride : torch.jit.Final[int] = module.stride
-                                    padding : torch.jit.Final[int] = module.padding
-                                    dilation : torch.jit.Final[int] = module.dilation
-                                    groups : torch.jit.Final[int] = module.groups
-                                    def forward(self, g, X, W):
-                                        print(torch.numel(g) *1. / (torch.numel(X) + torch.numel(W)))
-                                        with torch.no_grad():
-                                            for i in range(self.batch_size):
-                                                g[i] = torch.nn.functional.conv2d(X[:,i:i+1,...], W[:,i:i+1,...], None, self.stride, self.padding, self.dilation, self.groups).transpose(0,1)
-                                            return g
-                                # @torch.jit.script
-                                # def grad_computation(g, X, W):
-                                #         #module.stride, module.padding, module.dilation, module.groups).transpose(0,1)
-                                # self.jit[module] = _tmp_()
-                                print("jit compiling backward pass for per-example gradients")
-                                self.jit[module] = torch.jit.trace(_tmp_(), (g, X, W), check_trace=False)
-                                self.jit[module] = torch.jit.optimize_for_inference(self.jit[module])
-                                torch.cuda.empty_cache()
-                            g[...] = self.jit[module](g, X, W)
-                            #g = torch.stack(g)
-                            # print(g.to("cpu", non_blocking=True).sum())
-                            # self.datasets[key].append(g.detach().cpu().numpy())
-                            # self.datasets[key].flush()
-                            # print("write")
-                            g *= -lr
-                            self.datasets[key][self.counter: self.counter + X.shape[1]] = g.to("cpu", non_blocking=True).numpy()[:]
-                            self.datasets2[key][self.counter: self.counter + X.shape[1]] = ids.to("cpu").numpy()[:]
-                            if self.counter + X.shape[1] == 512 * HALF_BUFFER:
-                                self.queues[key].put(0)
-                                print("put(0)", key)
-                            elif self.counter + X.shape[1] == 512 * FULL_BUFFER:
-                                self.queues[key].put(512 * HALF_BUFFER)
-                                print("put(512*HALF_BUFFER)", key)
+                            if module not in self.processes:
+                                self.setup_tracking(key, module, X, W)
+                            if len(self.shared_arrays[module]) == 2:
+                                # full rank
+                                g = self.pinned_buffers[module]
+                                g[...] = self.jit[module](g, X, W)
+                                g *= -lr
+                                g_array, id_array = self.shared_arrays[module]
+                                g_array[self.counter: self.counter + X.shape[1]] = g.to("cpu", non_blocking=True).numpy()[:]
+                                id_array[self.counter: self.counter + X.shape[1]] = ids.to("cpu").numpy()[:]
+                            elif len(self.shared_arrays[module]) == 3:
+                                # low rank
+                                u_array, v_array, id_array = self.shared_arrays[module]
+                                u_array[self.counter: self.counter + X.shape[1]] = -lr * X.transpose(0, 1).to("cpu", non_blocking=True).numpy()[:]
+                                v_array[self.counter: self.counter + X.shape[1]] = W.transpose(0, 1).to("cpu", non_blocking=True).numpy()[:]
+                                id_array[self.counter: self.counter + X.shape[1]] = ids.to("cpu").numpy()[:]
+                            if self.counter + X.shape[1] == X.shape[1] * HALF_BUFFER:
+                                self.queues[module].put((0, self.counter + X.shape[1]))
+                                self.flush_point = self.counter + X.shape[1]
+                                # print("put(0)", key)
+                            elif self.counter + X.shape[1] == X.shape[1] * FULL_BUFFER:
+                                self.queues[module].put((X.shape[1] * HALF_BUFFER, self.counter + X.shape[1]))
+                                self.flush_point = 0
+                                # print("put(512*HALF_BUFFER)", key)
                             # print("success")
                             # self.history_grp[key].resize(self.counter + X.shape[1], 0)
                             # self.history_grp[key][self.counter: self.counter + X.shape[1]] = g.detach().to("cpu", non_blocking=True).numpy()
@@ -408,7 +429,7 @@ class WrappedSGD(torch.optim.SGD):
             #     example_grp.create_dataset("ids", data=ids[i:i+1].detach().cpu().numpy())
             #     example_grp.create_dataset("labels", data=labels[i:i+1].detach().cpu().numpy())
             self.counter += len(ids)
-            if self.counter + len(ids) > 512 * FULL_BUFFER: #next buffer does not fit anymore.
+            if self.counter + len(ids) > len(ids) * FULL_BUFFER: #next buffer does not fit anymore.
                 self.counter = 0
             
 

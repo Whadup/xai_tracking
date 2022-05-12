@@ -39,14 +39,14 @@ class WeirdBatchNorm1d(nn.Module):
         else:
             return self.bn(x)
 class WeirdBatchNorm2d(nn.Module):
-    def __init__(self, *args, ghost_samples=GHOST_SAMPLES, **kwargs):
+    def __init__(self, *args, ghost_samples=0, **kwargs):
         super().__init__()
         self.bn = nn.BatchNorm2d(*args, **kwargs)
         self.ghost_samples = ghost_samples
     def forward(self, x):
 
         if self.training:
-            sample = X[:self.ghost_samples]
+            sample = x[:self.ghost_samples]
             ghost_sample = x[-self.ghost_samples:]
             y = self.bn(ghost_sample)
             mean = ghost_sample.mean((0,2,3), keepdim=True)#.detach() # experimental detach to disconnect ghost sample from model and remaining batch
@@ -61,21 +61,10 @@ class WeirdBatchNorm2d(nn.Module):
             tmp = (x - mean) / torch.sqrt(var + 1e-5)
             if self.bn.bias is not None:
                 tmp * self.bn.weight.weight.reshape(1, -1, 1, 1)  + self.bn.bias.bias.reshape(1, -1, 1, 1)
-            return tmp,
-        else:
-            return self.bn(x)
-    def forward(self, x):
-        if self.training:
-            y = self.bn(x[-self.ghost_samples:])
-            mean = x[-self.ghost_samples:].mean((0,2,3), keepdim=True)#.detach() # experimental detach to disconnect ghost sample from model and remaining batch
-            var = x[-self.ghost_samples:].var((0,2,3), keepdim=True, unbiased=False)#.detach() # experimental detach to disconnect ghost sample from model and remaining batch
-            tmp = (x - mean) / torch.sqrt(var + 1e-5)
-            # print(tmp.shape, self.bn.weight.shape, self.bn.bias.shape)
-            if self.bn.bias is not None:
-                tmp = tmp * self.bn.weight.reshape(1, -1, 1, 1) + self.bn.bias.reshape(1, -1, 1, 1)
             return tmp
         else:
             return self.bn(x)
+
 
 class VGG_net(nn.Module):
     def __init__(self, in_channels=3, num_classes=10, ghost_samples=GHOST_SAMPLES):
@@ -85,13 +74,14 @@ class VGG_net(nn.Module):
         self.conv_layers = self.create_conv_layers(VGG_types["VGG16"])
 
         self.fcs = nn.Sequential(
-            nn.Linear(512, 4096, bias=False),
-            nn.ReLU(),
-            nn.Dropout(),
-            nn.Linear(4096, 4096, bias=False),
-            nn.ReLU(),
-            nn.Dropout(),
-            nn.Linear(4096, num_classes, bias=False),
+            # nn.Linear(512, 4096, bias=False),
+            # nn.ReLU(),
+            # nn.Dropout(),
+            # nn.Linear(4096, 4096, bias=False),
+            # nn.ReLU(),
+            # nn.Dropout(),
+            # nn.AvgPool2d(kernel_size=1, stride=1),
+            nn.Linear(512, num_classes, bias=False),
         )
     
     def to_sequential(self):
@@ -134,8 +124,14 @@ class VGG_net(nn.Module):
 
 class ResNet(torchvision.models.resnet.ResNet):
     """ResNet variant that knows about ghost samples during batch normalization and that can be converted to a torch.nn.Sequential model""" 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, norm_layer=WeirdBatchNorm2d, **kwargs)
+    def __init__(self, *args, ghost_samples=0, large=False, **kwargs):
+        if ghost_samples > 0:
+            super().__init__(*args, norm_layer=WeirdBatchNorm2d, **kwargs)
+        else:
+            super().__init__(*args, norm_layer=torch.nn.BatchNorm2d, **kwargs)
+        if not large:
+            self.conv1 = torch.nn.Conv2d(3, 64, 3, stride=1, padding=1)
+        self.ghost_samples = ghost_samples
         self.fc.bias = None
     def to_sequential(self):
         return nn.Sequential(
@@ -154,6 +150,9 @@ class ResNet(torchvision.models.resnet.ResNet):
 def resnet50(**kwargs):
     """Factory for resnet 50 models"""
     return ResNet(torchvision.models.resnet.Bottleneck, [3, 4, 6, 3], **kwargs)
+
+def resnet18(**kwargs):
+    return ResNet(torchvision.models.resnet.BasicBlock, [2, 2, 2, 2], **kwargs)
 
 def wide_resnet50(**kwargs):
     return ResNet(torchvision.models.resnet.Bottleneck, [3, 4, 6, 3], width_per_group=128, **kwargs)

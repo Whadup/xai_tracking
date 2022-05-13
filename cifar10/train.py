@@ -70,7 +70,7 @@ def main():
     net = net.to(device)
     
     if example_wise:
-        optimizer = WrappedSGD(net.parameters(), lr=0.1, momentum=0.0, weight_decay=0.0, history_file="/ceph/cifar10_history")
+        optimizer = WrappedSGD(net.parameters(), lr=0.1, momentum=0.0, weight_decay=0.0, history_file="/ceph/debug")
         optimizer.hookup(net)
     else:
         optimizer = torch.optim.SGD(net.parameters(), lr=0.001, momentum=0.9, weight_decay=5e-4) 
@@ -82,7 +82,7 @@ def main():
     loss = nn.CrossEntropyLoss(reduction="none")
     # loss = nn.BCEWithLogitsLoss()
 
-    for e in range(200):
+    for e in range(1):
         print("starting epoch: " + str(e))
         correct = 0
         total = 0

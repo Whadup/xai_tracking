@@ -17,6 +17,10 @@ import numpy as np
 import itertools
 import io
 from copy import deepcopy
+from torch.utils.cpp_extension import load
+
+blocksparse = load(name="blocksparse", sources=[os.path.join(os.path.dirname(__file__),"blocksparse_convolution.cpp")])
+blocksparse_conv2d = blocksparse.blocksparse_conv2d
 
 FULL_BUFFER = 64
 HALF_BUFFER = FULL_BUFFER // 2
@@ -236,16 +240,17 @@ class WrappedSGD(torch.optim.SGD):
         else:
             raise RuntimeError(f"Unknown mode '{mode}'. We support 'batchwise' and 'examplewise'.")
         self.weight_saver = {}
+        os.makedirs(history_file, exist_ok=True)
         tmp = {}
         for i,group in enumerate(self.param_groups):
             for j,p in enumerate(group['params']):
-                self.weight_saver[p] = p.data.detach().clone()
+                # self.weight_saver[p] = p.data.detach().clone()
                 tmp[f"group{i}.param{j}"] = p.data.detach().cpu().numpy()
+                np.save(os.path.join(self.history_file, f"group{i}.param{j}.-1"), p.data.detach().cpu().numpy())
         
         # self.history =  h5py.File(history_file, "w") #, rdcc_nbytes=64*1024*1024*1024)
         # self.history_grp = self.history.create_group("history")
         self.history_file = history_file
-        os.makedirs(history_file, exist_ok=True)
         self.shared_arrays = {}
         self.garbage = []
         self.queues = {}
@@ -384,6 +389,10 @@ class WrappedSGD(torch.optim.SGD):
                             # with torch.cuda.stream(torch.cuda.Stream()):
                             X = self.per_example_input_buffers[module].transpose(0, 1)#.to(second_device)
                             W = self.per_example_output_buffers[module].transpose(0, 1)#.to(second_device)
+                            # g = torch.zeros((X.shape[1], *module.weight.shape)).to(X.device)
+                            # g = blocksparse_conv2d(g, X, W, module.stride, module.padding, module.dilation, module.groups)
+                            # print("NORM", torch.linalg.norm(g.sum(axis=0) - p.grad), torch.linalg.norm(p.grad))
+                            # print("MAX", g.abs().max())
                             if module not in self.processes:
                                 self.setup_tracking(key, module, X, W)
                             if len(self.shared_arrays[module]) == 2:
@@ -392,13 +401,13 @@ class WrappedSGD(torch.optim.SGD):
                                 g[...] = self.jit[module](g, X, W)
                                 g *= -lr
                                 g_array, id_array = self.shared_arrays[module]
-                                g_array[self.counter: self.counter + X.shape[1]] = g.to("cpu", non_blocking=True).numpy()[:]
+                                g_array[self.counter: self.counter + X.shape[1]] = g.to("cpu", non_blocking=False).numpy()[:]
                                 id_array[self.counter: self.counter + X.shape[1]] = ids.to("cpu").numpy()[:]
                             elif len(self.shared_arrays[module]) == 3:
                                 # low rank
                                 u_array, v_array, id_array = self.shared_arrays[module]
-                                u_array[self.counter: self.counter + X.shape[1]] = -lr * X.transpose(0, 1).to("cpu", non_blocking=True).numpy()[:]
-                                v_array[self.counter: self.counter + X.shape[1]] = W.transpose(0, 1).to("cpu", non_blocking=True).numpy()[:]
+                                u_array[self.counter: self.counter + X.shape[1]] = -lr * X.transpose(0, 1).to("cpu", non_blocking=False).numpy()[:]
+                                v_array[self.counter: self.counter + X.shape[1]] = W.transpose(0, 1).to("cpu", non_blocking=False).numpy()[:]
                                 id_array[self.counter: self.counter + X.shape[1]] = ids.to("cpu").numpy()[:]
                             if self.counter + X.shape[1] == X.shape[1] * HALF_BUFFER:
                                 self.queues[module].put((0, self.counter + X.shape[1]))

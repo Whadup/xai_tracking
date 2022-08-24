@@ -49,7 +49,7 @@ def ridge_plot(data, linewidth=2, sample_weights=None, highlight=None):
         scale = 0.5 * i / len(data) + 0.5
         x = data[group]
         kde_x = np.linspace(1.25*xmin, 1.25*xmax, 1000)
-        kde_y = gaussian_kde(x, weights=weights, bw_method=1e-1)(kde_x)
+        kde_y = gaussian_kde(x, weights=weights, bw_method=5e-2)(kde_x)
         f = px.line(x=kde_x, y=kde_y)
         # Restyle Trace a bit
         trace = f["data"][0]

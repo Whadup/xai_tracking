@@ -19,8 +19,9 @@ import io
 from copy import deepcopy
 from torch.utils.cpp_extension import load
 
-blocksparse = load(name="blocksparse", sources=[os.path.join(os.path.dirname(__file__),"blocksparse_convolution.cpp")])
+blocksparse = load(name="blocksparse", sources=[os.path.join(os.path.dirname(__file__),"blocksparse_convolution.cpp")],  verbose=False)
 blocksparse_conv2d = blocksparse.blocksparse_conv2d
+weights_conv2d = blocksparse.weights_conv2d
 
 FULL_BUFFER = 64
 HALF_BUFFER = FULL_BUFFER // 2
@@ -309,23 +310,23 @@ class WrappedSGD(torch.optim.SGD):
         g = torch.empty((X.shape[1], *module.weight.shape), requires_grad=False).pin_memory().to(second_device)
         self.pinned_buffers[module] = g
         if torch.numel(g) < torch.numel(X) + torch.numel(W):
-            class _tmp_(torch.nn.Module):
-                batch_size : torch.jit.Final[int] = X.shape[1]
-                stride : torch.jit.Final[int] = module.stride
-                padding : torch.jit.Final[int] = module.padding
-                dilation : torch.jit.Final[int] = module.dilation
-                groups : torch.jit.Final[int] = module.groups
-                def forward(self, g, X, W):
-                    # print(self.stride, self.padding, self.dilation, self.groups)
-                    # print(g[0, :g.shape[1], :g.shape[2], :g.shape[3], :g.shape[4]].shape)
-                    # print(torch.numel(g) *1. / (torch.numel(X) + torch.numel(W)))
-                    with torch.no_grad():
-                        for i in range(self.batch_size):
-                            g[i, :g.shape[1], :g.shape[2], :g.shape[3], :g.shape[4]] = torch.nn.functional.conv2d(X[:,i:i+1,...], W[:,i:i+1,...], None, self.dilation, self.padding, self.stride, self.groups).transpose(0,1)[:g.shape[1], :g.shape[2], :g.shape[3], :g.shape[4]]
-                        return g
-            print("jit compiling backward pass for per-example gradients")
-            self.jit[module] = torch.jit.trace(_tmp_(), (g, X, W), check_trace=False)
-            self.jit[module] = torch.jit.optimize_for_inference(self.jit[module])
+            # class _tmp_(torch.nn.Module):
+            #     batch_size : torch.jit.Final[int] = X.shape[1]
+            #     stride : torch.jit.Final[int] = module.stride
+            #     padding : torch.jit.Final[int] = module.padding
+            #     dilation : torch.jit.Final[int] = module.dilation
+            #     groups : torch.jit.Final[int] = module.groups
+            #     def forward(self, g, X, W):
+            #         # print(self.stride, self.padding, self.dilation, self.groups)
+            #         # print(g[0, :g.shape[1], :g.shape[2], :g.shape[3], :g.shape[4]].shape)
+            #         # print(torch.numel(g) *1. / (torch.numel(X) + torch.numel(W)))
+            #         with torch.no_grad():
+            #             for i in range(self.batch_size):
+            #                 g[i, :g.shape[1], :g.shape[2], :g.shape[3], :g.shape[4]] = torch.nn.functional.conv2d(X[:,i:i+1,...], W[:,i:i+1,...], None, self.dilation, self.padding, self.stride, self.groups).transpose(0,1)[:g.shape[1], :g.shape[2], :g.shape[3], :g.shape[4]]
+            #             return g
+            # print("jit compiling backward pass for per-example gradients")
+            # self.jit[module] = torch.jit.trace(_tmp_(), (g, X, W), check_trace=False)
+            # self.jit[module] = torch.jit.optimize_for_inference(self.jit[module])
             torch.cuda.empty_cache()
             existing_shm = shared_memory.SharedMemory(create=True, size=FULL_BUFFER * torch.numel(g) * 4)
             existing_shm2 = shared_memory.SharedMemory(create=True, size=len(g) * FULL_BUFFER * 4)
@@ -398,7 +399,7 @@ class WrappedSGD(torch.optim.SGD):
                             if len(self.shared_arrays[module]) == 2:
                                 # full rank
                                 g = self.pinned_buffers[module]
-                                g[...] = self.jit[module](g, X, W)
+                                g[...] = blocksparse_conv2d(g, X.transpose(0, 1), W.transpose(0, 1), module.stride, module.padding, module.dilation, module.groups)
                                 g *= -lr
                                 g_array, id_array = self.shared_arrays[module]
                                 g_array[self.counter: self.counter + X.shape[1]] = g.to("cpu", non_blocking=False).numpy()[:]
@@ -406,8 +407,8 @@ class WrappedSGD(torch.optim.SGD):
                             elif len(self.shared_arrays[module]) == 3:
                                 # low rank
                                 u_array, v_array, id_array = self.shared_arrays[module]
-                                u_array[self.counter: self.counter + X.shape[1]] = -lr * X.transpose(0, 1).to("cpu", non_blocking=False).numpy()[:]
-                                v_array[self.counter: self.counter + X.shape[1]] = W.transpose(0, 1).to("cpu", non_blocking=False).numpy()[:]
+                                u_array[self.counter: self.counter + X.shape[1]] = X.transpose(0, 1).to("cpu", non_blocking=False).numpy()[:]
+                                v_array[self.counter: self.counter + X.shape[1]] = -lr * W.transpose(0, 1).to("cpu", non_blocking=False).numpy()[:]
                                 id_array[self.counter: self.counter + X.shape[1]] = ids.to("cpu").numpy()[:]
                             if self.counter + X.shape[1] == X.shape[1] * HALF_BUFFER:
                                 self.queues[module].put((0, self.counter + X.shape[1]))
@@ -464,20 +465,29 @@ class WrappedOptimizer(torch.optim.Optimizer):
 
             def __init__(self, *args, **kwargs):
                 super().__init__(*args, **kwargs)
+                self.weight_saver = {}
+                tmp = {}
+                for i,group in enumerate(self.param_groups):
+                    for j,p in enumerate(group['params']):
+                        self.weight_saver[p] = p.data.detach().clone()
+                        tmp[f"group{i}.param{j}"] = p.data.detach().cpu().numpy()
                 
+                self.history =  h5py.File(history_file, "w")
+                grp = self.history.create_group("iteration_0")
+                for key in tmp:
+                    ds = grp.create_dataset(key, data=tmp[key], compression="lzf")
+                self.counter = 1
+
 
             # def __del__(self):
             #     self.history.close()
 
             @torch.no_grad()
-            def step(self, *args):
+            def step(self, *args, ids=None, labels=None):
                 for group in self.param_groups:
                     for p in group['params']:
                         self.weight_saver[p].copy_(p.data)
                 super().step(*args)
-
-            @torch.no_grad()
-            def archive(self, ids=None, labels=None):
                 tmp = {}
                 grp = self.history.create_group(f"iteration_{self.counter}")
                 for i, group in enumerate(self.param_groups):
@@ -494,8 +504,9 @@ class WrappedOptimizer(torch.optim.Optimizer):
 
 
 class History(torch.utils.data.Dataset):
-    def __init__(self, history_file="/raid/history.hdf5"):
+    def __init__(self, history_file="/raid/history.hdf5", parameters=None):
         super().__init__()
+        self.parameters = parameters
         self.history_file = history_file
         self.history  = h5py.File(history_file, "r", rdcc_nbytes=1024**3)
         self.l = len(self.history.keys()) - 1
@@ -521,6 +532,8 @@ class History(torch.utils.data.Dataset):
         grp = history[f"iteration_{i}"]
         x = {}
         for key in grp:
+            if self.parameters is not None and key not in self.parameters:
+                continue
             if key not in ("ids", "labels"):
                 x[key] = grp[key][...]
         # print(x)
@@ -538,6 +551,30 @@ class History(torch.utils.data.Dataset):
             #     t2[:len(x[2])] = x[2]
             #     return x[0], t, t2
             # return x
+
+class HistoryV2(torch.utils.data.Dataset):
+    def __init__(self, history_folder="/raid/pfahler/tmp/", parameters=None, shapes=None):
+        super().__init__()
+        self.files = [f for f in os.listdir(history_folder) if not f.startswith("ids") and ".aggregate" in f]
+        self.parameters = set([".".join(f.split(".")[:2]) for f in self.files])
+        if parameters is not None:
+            self.parameters = parameters
+        print(self.parameters)
+        print(*shapes.keys())
+        print(shapes)
+        self.memmaps = {".".join(f.split(".")[:2]): np.memmap(os.path.join(history_folder, f), dtype=np.float32, mode="r") for f in self.files if ".".join(f.split(".")[:2]) in self.parameters}
+        self.memmaps = {a:b.reshape(-1, *shapes[a]) for a,b in self.memmaps.items()}
+        self.l = len(next(iter(self.memmaps.values())))
+
+    def __len__(self):
+        return self.l
+        # return (len(self.history["default"].namelist()) - 1)
+    def __getitem__(self, ii):
+        x = {}
+        for parameter in self.parameters:
+            # x[parameter] = self.memmaps[parameter][ii]
+            x[parameter] = np.copy(self.memmaps[parameter][ii])
+        return x, np.array([ii]), np.array([-1])
 
 def block_diagonal(*arrs):
         bad_args = [k for k in range(len(arrs)) if not (isinstance(arrs[k], torch.Tensor) and arrs[k].ndim == 2)]
@@ -576,15 +613,24 @@ class SequentialWrapper(nn.Module):
     def forward(self, x, weights_batch, weights_batch_size=None):
 
         def _get_first_weight(weights_batch, module):
+            p = None
             for _, p in enumerate(module.parameters()):
                 break
+            if p is None:
+                return None
             key = self.lookup[p]
-            w = weights_batch[key]
-            return w
+            if key in weights_batch:
+                w = weights_batch[key]
+                return w
+            return None
 
         contributions = []
         preactivations = []
         for module in self.sequence:
+            # TODO: Check if weight is available, else just compute x and move on
+            if _get_first_weight(weights_batch, module) is None:
+                x = module(x)
+                continue
             if isinstance(module, nn.Conv2d):
                 w = _get_first_weight(weights_batch, module)
                 contribution = F.conv2d(
@@ -712,13 +758,17 @@ class SequentialWrapper(nn.Module):
         return x, contributions, preactivations
 
 
-def explain(net, example, history_file="/raid/history.hdf5", batch_size=3, device="cuda"):
+def explain(net, example, history_file="/raid/cifar10_batchwise_history.hdf5", history_folder="/raid/pfahler/tmp", batch_size=512, dataset_labels=None, device="cuda", example_wise=True):
     wrapped = SequentialWrapper(net.eval()).eval()
-    h = History(history_file=history_file)
+    if example_wise:
+        h = HistoryV2(history_folder=history_folder, parameters=["group0.param12"], shapes={b:a.shape for a,b in wrapped.lookup.items()}) # 
+    else:
+        h = History(history_file=history_file, parameters=["group0.param0", "group0.param1", "group0.param10", "group0.param12"])
     _, init, _ = wrapped(example, {k:torch.tensor(v).to(device).unsqueeze(0) for k,v in h[-1][0].items()}, 1)
 
-
-    weights = torch.utils.data.DataLoader(h, batch_size=batch_size, shuffle=True, num_workers=10, drop_last=False, pin_memory=True, prefetch_factor=3)
+    if dataset_labels is not None:
+        dataset_labels = torch.tensor(dataset_labels)
+    weights = torch.utils.data.DataLoader(h, batch_size=batch_size if example_wise else 1, shuffle=False, num_workers=2, drop_last=False, pin_memory=True, prefetch_factor=1)
     print(len(weights))
     dots = None
     labels = None
@@ -727,10 +777,16 @@ def explain(net, example, history_file="/raid/history.hdf5", batch_size=3, devic
     counter = 0
     with torch.no_grad():
         for w, i, l in tqdm.tqdm(weights, dynamic_ncols=True):
+            if dataset_labels is not None:
+                l = dataset_labels[i]
             counter +=1
             # if counter> 2048:
             #     break
             w = {k:v.to(device) for k,v in w.items()}
+            if not example_wise:
+                l = l[:, :88]
+                i = i[:, :88]
+                #TODO: This is obviously bullshit, but a quick workaround around an earlier fuckup that has since been fixed, but for the output we have on disk we need it...
             actual_batchsize = len(next(iter(w.values())))
             outputs2, contribs, pre = wrapped(example, w, actual_batchsize)
             contribs = list([c.reshape(*c.shape[1:]) for c in contribs])
@@ -754,9 +810,10 @@ def explain(net, example, history_file="/raid/history.hdf5", batch_size=3, devic
 
                 dots = [torch.cat((d1, d2), dim=0) for d1, d2 in zip(dots, new_dots)]
                 c_norms = [torch.cat((d1, d2), dim=0) for d1, d2 in zip(c_norms, new_c_norms)]
-
-                labels = torch.cat((labels, l), dim=0)
-                ids = torch.cat((ids, i), dim=0)
+                # print(l.shape, torch.nn.functional.pad(l, [0, labels.shape[1] - l.shape[1]]).shape)
+                labels = torch.cat((labels, torch.nn.functional.pad(l, [0, labels.shape[1] - l.shape[1]])), dim=0)
+                ids = torch.cat((ids, torch.nn.functional.pad(i, [0, ids.shape[1] - i.shape[1]])), dim=0)
+                # print(dots[0].shape, c_norms[0].shape, labels.shape)
     print(*[c.shape for c in preactivations])
     # contributions = list([c.reshape(*c.shape[1:]) for c in contributions]) #TODO: we don't actually need to store all of these, we can just compute the dot products and norms on the fly on the gpu and keep only those.
     # cont_pres = list([c.sum(dim=0, keepdim=True) for c in contributions])
@@ -771,7 +828,7 @@ def explain(net, example, history_file="/raid/history.hdf5", batch_size=3, devic
     #     torch.sqrt((c * c).sum(dim=list(range(1, len(c.shape))))) for c in contributions
     # ])
     p_norms = list([
-        torch.sqrt((p.cpu() * p.cpu()).sum(dim=list(range(1, len(p.shape))))) for p in preactivations
+        torch.sqrt((p * p).sum(dim=list(range(1, len(p.shape))))).cpu() for p in preactivations
     ])
     cosines = list([
         d / (p * c + 1e-14) for d, p, c in zip(dots, p_norms, c_norms)

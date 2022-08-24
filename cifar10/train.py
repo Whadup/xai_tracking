@@ -25,7 +25,7 @@ import os
 PATH = os.path.dirname(__file__)
 
 def main():
-    example_wise = True
+    example_wise = False
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(device)
     transform = transforms.Compose(
@@ -70,10 +70,11 @@ def main():
     net = net.to(device)
     
     if example_wise:
-        optimizer = WrappedSGD(net.parameters(), lr=0.1, momentum=0.0, weight_decay=0.0, history_file="/ceph/debug")
+        optimizer = WrappedSGD(net.parameters(), lr=0.1, momentum=0.0, weight_decay=0.0, history_file="/raid/pfahler/cifar10_history")
         optimizer.hookup(net)
     else:
-        optimizer = torch.optim.SGD(net.parameters(), lr=0.001, momentum=0.9, weight_decay=5e-4) 
+        # optimizer = WrappedOptimizer(torch.optim.SGD, history_file="/raid/pfahler/tmp/cifar10_batchwise_history.hdf5")
+        optimizer = torch.optim.SGD(net.parameters(), lr=0.001) # momentum=0.9, weight_decay=5e-4 
 
     # optimizer = WrappedSGD(net.parameters(), lr=0.1, history_file="/raid/pfahler/cifar10_history")
 
@@ -82,7 +83,7 @@ def main():
     loss = nn.CrossEntropyLoss(reduction="none")
     # loss = nn.BCEWithLogitsLoss()
 
-    for e in range(1):
+    for e in range(200):
         print("starting epoch: " + str(e))
         correct = 0
         total = 0
@@ -112,10 +113,15 @@ def main():
                 total_loss += l.item() * labels.size(0) 
             pbar.set_description(f"Loss: {total_loss / total:.4f} Accuracy: {1.0 * correct / total:.4f}")
             l.backward()
-            optimizer.step(ids=ind, labels=labels)
+            if example_wise:
+                optimizer.step(ids=ind, labels=labels)
+            else:
+                # optimizer.step(ids=ind[:-ghost_samples], labels=labels[:-ghost_samples])
+                optimizer.step()
 
 
-        torch.save(net.state_dict(), os.path.join(PATH, "cifar10.pt"))
+        if example_wise:
+            torch.save(net.state_dict(), os.path.join("/raid/pfahler/cifar10_checkpoints", f"cifar10_{e}.pt"))
         # torch.save(net.state_dict(), "network.pt")
         # torch.save(optimizer, "optimizer.pt")
         print("Training loss is: " + str(l.item()))
@@ -137,7 +143,11 @@ def main():
         print("Test accuracy is: " + str(test_acc))
         scheduler.step()
         net = net.to(device)
-    torch.save(net.state_dict(), os.path.join(PATH, "cifar10.pt"))
+    if example_wise:
+        torch.save(net.state_dict(), os.path.join(PATH, "cifar10.pt"))
+    else:
+        torch.save(net.state_dict(), os.path.join(PATH, "batchwise_cifar10.pt"))
+
     # torch.save(net.cpu().state_dict(), "cifar_log.pt")  
     optimizer.done()
     print("done with everything")

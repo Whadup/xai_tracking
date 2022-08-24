@@ -17,12 +17,9 @@ import pickle
 from typing import Tuple, Any
 from plotly.subplots import make_subplots
 import plotly.express as px
-from ogb.graphproppred import PygGraphPropPredDataset
-from torch_geometric.data import DataLoader
-from torch_geometric.nn import global_mean_pool, global_add_pool
-from xai import *
-from vgg import VGG_net, GHOST_SAMPLES
-from ridgeplot import ridge_plot, image
+from xai_tracking.xai import *
+from xai_tracking.nn import VGG_net, GHOST_SAMPLES
+from xai_tracking.ridgeplot import ridge_plot, image
 torch.multiprocessing.set_sharing_strategy('file_system')
 torch.backends.cudnn.benchmark = False
 torch.backends.cudnn.deterministic = True
@@ -30,40 +27,6 @@ torch.backends.cudnn.deterministic = True
 import os
 PATH = os.path.dirname(__file__)
 
-class ClassSampler(torch.utils.data.BatchSampler):
-    def __init__(self, data_source, batch_size, drop_last):
-        self.data_source = data_source
-        self.batch_size = batch_size - GHOST_SAMPLES
-        self.drop_last = drop_last
-        self.generator = None
-
-    def __iter__(self):
-        self.classes = {}
-        for i, (d, y, j) in enumerate(self.data_source):
-            if y not in self.classes:
-                self.classes[y] = []
-            self.classes[y].append(i)
-        for y in self.classes:
-            self.classes[y] = torch.LongTensor(self.classes[y])[torch.randperm(len(self.classes[y]))]
-        if self.generator is None:
-            generator = torch.Generator()
-            generator.manual_seed(int(torch.empty((), dtype=torch.int64).random_().item()))
-        else:
-            generator = self.generator
-        while len(self.classes):
-            cls = list(self.classes.keys())[torch.randint(high=len(self.classes), size=(1,)).item()]
-            batch = self.classes[cls][:self.batch_size].tolist()
-            self.classes[cls] = self.classes[cls][self.batch_size:]
-            # if self.drop_last and len(self.classes[cls]) < self.batch_size:
-            #     del self.classes[cls]
-            for y in self.classes:
-                for x in self.classes[y][:GHOST_SAMPLES//10]:
-                    batch.append(x.item())
-                self.classes[y] = self.classes[y][GHOST_SAMPLES//10:]
-            self.classes = {x:y for x,y in self.classes.items() if len(y) >= (GHOST_SAMPLES//10 + self.batch_size)}
-                # if self.drop_last and len(self.classes[y]) < self.batch_size:
-                #     del self.classes[y]
-            yield batch
 
 
 def main():
@@ -71,12 +34,21 @@ def main():
     print(device)
     transform = transforms.Compose(
         [transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
+        ])
+    raw_transform = transforms.Compose(
+        [transforms.ToTensor(),
+        transforms.Normalize((0.5,0.5,0.5), (0.5,0.5,0.5))
+        ])
     batch_size = 1
     trainset = WrappedDataset(CIFAR10(root='cifar10/data', train=True,
-                                            download=True, transform=transform))
+                                            download=True, transform=raw_transform))
+    dataset_labels = np.array([y for _, y, _ in trainset])
     testset = WrappedDataset(CIFAR10(root='cifar10/data', train=False,
                                          download=True, transform=transform))
+    
+    raw_testset = WrappedDataset(CIFAR10(root='cifar10/data', train=False,
+                                         download=True, transform=raw_transform))
     testloader = torch.utils.data.DataLoader(testset, batch_size=batch_size,
                                             shuffle=True, num_workers=8)
     # problem mit shuffle true
@@ -86,14 +58,26 @@ def main():
     print("loaded data...")
     CLASS_NAMES = ('plane', 'car', 'bird', 'cat',
             'deer', 'dog', 'frog', 'horse', 'ship', 'truck')
-    net = VGG_net().to_sequential()
-    net.load_state_dict(torch.load(os.path.join(PATH, "cifar10.pt")))
+    example_wise = True
+
+    net = VGG_net(ghost_samples=0 if example_wise else 1).to_sequential()
+    if example_wise:
+        net.load_state_dict(torch.load(os.path.join(PATH, "cifar10.pt")))
+    else:
+        net.load_state_dict(torch.load(os.path.join(PATH, "batchwise_cifar10.pt")))
     net = net.to(device)
     net = net.eval()
 
     pbar = tqdm.tqdm(testloader)
     
-    for data in pbar:
+    test_examples_indices = [2]
+    test_examples_batch = torch.stack([testset[i][0] for i in test_examples_indices]).to(device)
+    test_examples_predicted_probs, test_examples_predicted_labels = torch.max(F.softmax(net(test_examples_batch), dim=1), dim=1)
+    test_examples_true_labels = torch.Tensor([testset[i][1] for i in test_examples_indices]).long().to(device)
+
+    data = (test_examples_batch, test_examples_true_labels, torch.tensor(test_examples_indices))
+
+    while True:
         # get the inputs; data is a list of [inputs, labels, index of batch]
         inputs, labels, ind = data
         inputs, labels = inputs.to(device), labels.to(device)
@@ -101,20 +85,27 @@ def main():
         prob = torch.nn.functional.softmax(net(inputs[:1]).view(-1), dim=0)
         pred = prob.argmax()
         print(prob[pred])
-        if CLASS_NAMES[pred.item()] != "frog":
-            continue
+        # if CLASS_NAMES[pred.item()] != "truck":
+        #     continue
         if pred != labels[:1].item():
             print("missclassified")
             continue
 
         print(CLASS_NAMES[labels[:1].item()], CLASS_NAMES[pred.item()])
-        contributions, preactivations, cosines, dot_products, norms, l, ids = explain(net, inputs[:1], history_file="/raid/cifar10.hdf5")
+        contributions, preactivations, cosines, dot_products, norms, l, ids = explain(net, inputs[:1], history_file="/raid/pfahler/cifar10_batchwise_history.hdf5", history_folder="/raid/pfahler/tmp", dataset_labels=dataset_labels, example_wise=example_wise)
+        # pickle.dump((contributions, preactivations, cosines, dot_products, norms, l, ids), open("tmp.pickle", "wb"))
+        # (contributions, preactivations, cosines, dot_products, norms, l, ids) = pickle.load(open("tmp.pickle", "rb"))
         classes, weights = class_statistics(contributions, preactivations, cosines, norms, l)
         slides = ""
+        raw_inputs, _, _ = raw_testset[ind[0]]
+        print(raw_inputs)
+        for p in preactivations:
+            print(p.shape)
+            print(torch.linalg.norm(p))
         with io.StringIO() as f:
-            image(np.uint8(255 * (inputs[0].cpu().permute(1, 2, 0).numpy() * 0.5 + 0.5))).write_html(f, include_plotlyjs=False, full_html=False)
+            image(np.uint8(255 * (raw_inputs.cpu().permute(1, 2, 0).numpy() * 0.5 + 0.5))).write_html(f, include_plotlyjs=False, full_html=False)
             slides += f"<section><h2>Input</h2>{f.getvalue()}</section>"
-        for i, layer in enumerate(list(classes.keys())[::-1]):
+        for i, layer in enumerate(list(classes.keys())):
             dirs, sample_weights = classes[layer], weights[layer]
             dirs = {CLASS_NAMES[y]:d for y,d in dirs.items() if y >= 0}
             sample_weights = {CLASS_NAMES[y]:d for y,d in sample_weights.items()}
@@ -125,22 +116,24 @@ def main():
                 slides += f"<section><h2>{layer}</h2>{f.getvalue()}</section>"
             dots = cosines[i]
             most_influential = torch.zeros(len(trainset))#ids[dots.argmax()]
-            for ii, dot in zip(ids, dots):
-                most_influential[ii] += dot.clamp(min=0)
-            most_influential = torch.topk(most_influential, 8).indices
+            print((cosines[i] * norms[i]).sum(), torch.linalg.norm(preactivations[i]))
+            for ii, norm, dot in zip(ids, norms[i], dots):
+                most_influential[ii] += norm * dot#.clamp(min=0)
+            print(torch.topk(most_influential, 100), dataset_labels[torch.topk(most_influential, 100).indices])
+            most_influential = torch.topk(most_influential, 100).indices[:64]
             with io.StringIO() as f:
-                fig = make_subplots(rows=2, cols=4)
-                fig.add_trace(px.imshow(np.uint8(255 * (inputs[0].cpu().permute(1, 2, 0).numpy() * 0.5 + 0.5))).data[0], row=1, col=1)
-                for j, img in enumerate(most_influential[:7]):
+                fig = make_subplots(rows=8, cols=8)
+                fig.add_trace(px.imshow(np.uint8(255 * (raw_inputs.cpu().permute(1, 2, 0).numpy() * 0.5 + 0.5))).data[0], row=1, col=1)
+                for j, img in enumerate(most_influential[:63]):
                     j += 1
                     img = img.item()
                     img = trainset[img][0]
-                    fig.add_trace(px.imshow(np.uint8(255 * (img.cpu().permute(1, 2, 0).numpy() * 0.5 + 0.5))).data[0], row= 1 + j // 4, col = 1 +  j % 4)
+                    fig.add_trace(px.imshow(np.uint8(255 * (img.cpu().permute(1, 2, 0).numpy() * 0.5 + 0.5))).data[0], row= 1 + j // 8, col = 1 +  j % 8)
                 fig.write_html(f)
                 slides += f"<section>{f.getvalue()}</section>"
             slides += "</section>"
 
-        with open(os.path.join(PATH, "plots.html"), "w") as output:
+        with open(os.path.join(PATH, f"plots_{example_wise}.html"), "w") as output:
             output.write(open("static/header.html", "r").read().format(slides=slides))
         # print(list([c.shape for c in contributions]))
         print(list([c.shape for c in preactivations]))
